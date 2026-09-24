@@ -162,6 +162,28 @@ class ChangeGuardRequest(BaseModel):
     )
 
 
+class ActivateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_id: str = Field(
+        ..., description="Id of the saved analysis version to publish (an_ + 16 hex chars)"
+    )
+    expected_revision: int = Field(
+        ...,
+        ge=0,
+        description="Pointer revision the caller saw; activation proceeds only when it "
+        "still matches (optimistic concurrency control)",
+    )
+
+    @field_validator("analysis_id")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+
 class ListAnalysesResponse(BaseModel):
     total: int
     analyses: list[dict[str, Any]]

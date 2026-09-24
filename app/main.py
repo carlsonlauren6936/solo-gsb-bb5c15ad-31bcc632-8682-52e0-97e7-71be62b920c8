@@ -14,6 +14,9 @@ GET    /api/analyses/{id}/redundant-rules    per-rule removability inventory (re
 GET    /api/analyses/{id}/export.json        download the result as a JSON file
 GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
 POST   /api/analyses/{id}/change-guard/{oid} authorize the semantic diff against caller-supplied grants
+GET    /api/active                           current published-version pointer (revision + active_id)
+POST   /api/active/activate                  publish a saved version, checked against expected_revision
+GET    /api/active/history                   read-only audit log of successful pointer switches
 GET    /health                               liveness probe
 """
 
@@ -35,7 +38,13 @@ from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
 from .merge_precheck import build_batch, merge_precheck
 from .redundant import redundant_rule_inventory
-from .schemas import AnalyzeRequest, ChangeGuardRequest, MergePrecheckRequest, SimulateRequest
+from .schemas import (
+    ActivateRequest,
+    AnalyzeRequest,
+    ChangeGuardRequest,
+    MergePrecheckRequest,
+    SimulateRequest,
+)
 from .simulate import PatchError, apply_patch, rebuild_input_rules
 
 
@@ -83,6 +92,20 @@ async def _change_guard_error_handler(_request, exc: ChangeGuardError):
     return JSONResponse(
         status_code=400,
         content={"error": "invalid_change_guard", "detail": str(exc), "issues": exc.issues},
+    )
+
+
+@app.exception_handler(db.RevisionConflict)
+async def _revision_conflict_handler(_request, exc: db.RevisionConflict):
+    # Another publish landed first: report the pointer state that won the race.
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": "revision_conflict",
+            "detail": "expected_revision does not match the current pointer revision; "
+            "refetch GET /api/active and retry",
+            "current": exc.current,
+        },
     )
 
 
@@ -373,3 +396,59 @@ def change_guard_versions(base_id: str, target_id: str, req: ChangeGuardRequest)
         raise HTTPException(status_code=404, detail=f"analysis '{target_id}' not found")
 
     return guard_changes(base, target, grants)
+
+
+@app.get("/api/active")
+def get_active_pointer() -> dict[str, Any]:
+    """Current publication pointer.
+
+    Starts at ``{"active_id": null, "revision": 0}`` and only ever points at
+    saved analysis versions.
+    """
+    return db.get_active()
+
+
+@app.post("/api/active/activate", status_code=200)
+def activate_pointer(req: ActivateRequest) -> dict[str, Any]:
+    """Publish a saved analysis version as the active one.
+
+    The request carries the ``revision`` the caller last saw on
+    ``GET /api/active``. Inside one SQLite transaction the stored revision is
+    compared with ``expected_revision``; on a match the pointer moves to the
+    target version, the revision increments and an audit row (previous/new
+    versions, revision, timestamp) is appended. A stale ``expected_revision``
+    means another publish won the race and yields ``409`` with the current
+    state. Only saved versions may be published; unknown targets are ``404``.
+    """
+    if not ANALYSIS_ID_RE.match(req.analysis_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid analysis id format: '{req.analysis_id}'; "
+            "expected 'an_' followed by 16 lowercase hexadecimal characters",
+        )
+
+    # Existence is checked before opening the write transaction, so requests
+    # for unsaved/unknown versions never take the publication write lock.
+    if db.get_analysis(req.analysis_id) is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{req.analysis_id}' not found")
+
+    result = db.activate_pointer(req.analysis_id, req.expected_revision)
+    return {
+        "active": {
+            "active_id": result["active_id"],
+            "revision": result["revision"],
+            "activated_at": result["activated_at"],
+            "history_seq": result["history_seq"],
+        },
+        "previous": result["previous"],
+    }
+
+
+@app.get("/api/active/history")
+def get_active_history(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """Read-only audit log of successful pointer switches, newest first."""
+    total, entries = db.list_active_history(limit=limit, offset=offset)
+    return {"total": total, "history": entries}

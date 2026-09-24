@@ -12,7 +12,8 @@ IPv4/IPv6 CIDR 规则，服务端按 **最长前缀匹配（LPM）+ 同前缀优
   且改变动作时给出提示。
 
 分析结果是**确定性**的：相同输入得到相同 `ruleset_hash` 与版本 `id`。支持保存分析版本、
-按条件查询规则/发现、导出 JSON。
+按条件查询规则/发现、导出 JSON，并通过一个带乐观锁（`revision`）的**发布指针**在已保存
+版本之间安全切换，切换历史只增可查。
 
 ---
 
@@ -104,6 +105,9 @@ N 的实际覆盖碎片。
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
 | GET | `/api/analyses/{base}/diff/{target}` | 两个已保存版本的**最终生效动作语义差异**（最小 CIDR + 分类计数） |
 | POST | `/api/analyses/{base}/change-guard/{target}` | **变更守卫**：用调用方给出的授权条目核对两版本的语义差异，返回是否通过及未授权的最小 CIDR |
+| GET | `/api/active` | 查看**发布指针**：当前发布的已保存版本 `active_id` 与乐观锁 `revision`（初始 `null` / `0`） |
+| POST | `/api/active/activate` | **发布/切换**已保存版本：提交 `analysis_id` 与 `expected_revision`，同一事务内核对并递增 `revision`；冲突返回 `409` 及当前状态 |
+| GET | `/api/active/history` | **只读**发布历史：每次成功切换的前后版本、时间与 revision（`limit`/`offset` 分页） |
 | GET | `/health` | 健康检查 |
 
 ### 示例：提交分析
@@ -652,6 +656,114 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 - 字段层面错误（`from_action == to_action`、未知动作、空 `authorizations`、多余字段等）→ `422`；
 - 任一版本不存在 → `404`。
 
+### 发布指针（active pointer）
+
+所有已保存版本之上维护一个**发布指针**，回答"当前对外发布的是哪一个分析版本"。服务首次
+初始化时指针为：
+
+```json
+{"active_id": null, "revision": 0}
+```
+
+`revision` 是单调递增的乐观并发版本号：**每一次成功的 activate 都 +1**（即使目标与当前
+版本相同，也视为一次新的发布动作）。指针**只能指向已保存版本**，不会引用未落库的预演/
+合并结果。
+
+#### 查看当前指针
+
+```bash
+curl -s http://localhost:8080/api/active
+# {"active_id":"an_e38b58f57faf2325","revision":2}
+```
+
+#### 发布 / 切换版本
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `analysis_id` | 要发布的**已保存版本** ID（`an_` + 16 个小写十六进制字符） |
+| `expected_revision` | 调用方上一次 `GET /api/active` 看到的 revision；只有它与库中当前 revision **完全相等**时切换才会落地 |
+
+核对 revision、更新指针、递增 revision、写入审计记录在**同一个 SQLite 写事务**
+（`BEGIN IMMEDIATE`）内完成，因此并发发布会被串行化：同一个 revision 值下**只有一个请求
+能成功**，后来者拿到 `409` 与当前最新状态，不会互相覆盖。
+
+```bash
+# 第一次发布：从 null/0 发布到 v1
+curl -s -X POST http://localhost:8080/api/active/activate \
+  -H 'Content-Type: application/json' \
+  -d '{"analysis_id": "an_e38b58f57faf2325", "expected_revision": 0}'
+```
+
+成功响应（`200`）记录了切换后的状态与切换前状态：
+
+```json
+{
+  "active": {
+    "active_id": "an_e38b58f57faf2325",
+    "revision": 1,
+    "activated_at": "2026-09-24T08:30:00Z",
+    "history_seq": 1
+  },
+  "previous": {"active_id": null, "revision": 0}
+}
+```
+
+切换到另一个版本时带上当前 revision（上例之后为 `1`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/active/activate \
+  -H 'Content-Type: application/json' \
+  -d '{"analysis_id": "an_8914e028acea3413", "expected_revision": 1}'
+# {"active": {"active_id": "an_8914e028acea3413", "revision": 2, "...": "..."},
+#  "previous": {"active_id": "an_e38b58f57faf2325", "revision": 1}}
+```
+
+#### revision 冲突（409）
+
+若在调用方读取状态之后已有别的发布成功（指针 revision 已经前进），本次激活被整体拒绝，
+指针、revision 与历史均不变，响应体带回**当前状态**供调用方重新读取后重试：
+
+```json
+{
+  "error": "revision_conflict",
+  "detail": "expected_revision does not match the current pointer revision; refetch GET /api/active and retry",
+  "current": {"active_id": "an_8914e028acea3413", "revision": 2}
+}
+```
+
+#### 只读发布历史
+
+```bash
+curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
+```
+
+每次成功切换追加一条只增不改的审计记录（**新的在前**），包含前后版本、时间与 revision：
+
+```json
+{
+  "total": 2,
+  "history": [
+    {"seq": 2, "revision": 2, "previous_id": "an_e38b58f57faf2325",
+     "active_id": "an_8914e028acea3413", "activated_at": "2026-09-24T08:31:00Z"},
+    {"seq": 1, "revision": 1, "previous_id": null,
+     "active_id": "an_e38b58f57faf2325", "activated_at": "2026-09-24T08:30:00Z"}
+  ]
+}
+```
+
+历史为只读接口，没有任何写入/删除入口；`limit`（1–200，默认 50）与 `offset` 分页，
+非法分页参数返回 `422`。
+
+错误码：
+
+- `analysis_id` 格式非法（不是 `an_` + 16 个小写十六进制字符）→ `400`；
+- 目标版本未保存/不存在 → `404`（在开启写事务之前检查，且失败不推进 revision）；
+- `expected_revision` 与当前 revision 不一致（并发发布落败）→ `409 revision_conflict`，
+  响应中 `current` 为当前指针状态；
+- 字段层面错误（缺字段、`expected_revision` 为负数、多余字段等）→ `422`。
+
 ### 错误处理
 
 - 非法 CIDR（语法错误、主机位非零、rule_id 重复等）→ `400`，形如
@@ -665,6 +777,8 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
   `{"error": "invalid_cidr", "detail": "invalid CIDR '10.0.0.5/24' (...)"}`
 - 变更守卫授权集非法（授权 CIDR 非严格 CIDR、异类授权相互重叠等）→ `400`，形如
   `{"error": "invalid_change_guard", "detail": "...", "issues": ["...全部问题..."]}`
+- 发布指针的 `expected_revision` 与当前 revision 不一致（并发发布冲突）→ `409`，形如
+  `{"error": "revision_conflict", "detail": "...", "current": {"active_id": "...", "revision": 2}}`
 - 字段类型/取值错误（未知 action、空规则列表、多余字段、缺少必填查询参数等）→ `422`（Pydantic 校验错误）
 - 版本不存在 → `404`
 
@@ -684,9 +798,10 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 │   ├── simulate.py      # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
 │   ├── merge_precheck.py # 双批次合并预检：两侧分别重算 + 改变范围精确叠加 + A 后 B 合并重算（纯函数）
 │   ├── schemas.py       # Pydantic v2 请求/响应模型
-│   ├── db.py            # SQLite 持久层（analyses / rules / findings 三表）
+│   ├── db.py            # SQLite 持久层（analyses / rules / findings / active_pointer / active_history 五表）
 │   └── main.py          # FastAPI 路由
 ├── tests/test_api.py           # 端到端测试（pytest + TestClient）
+├── tests/test_active.py        # 发布指针与乐观锁（含并发发布）测试
 ├── tests/test_diff.py          # 语义差异端点测试
 ├── tests/test_change_guard.py  # 变更守卫端点测试
 ├── tests/test_decision_map.py  # CIDR 决策地图端点测试
@@ -706,7 +821,17 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 - `rules(analysis_id, rule_index, rule_id, cidr, ip_version, action, priority, source_tag,
   role, status, covered, has_conflict)` —— 支持 SQL 过滤；
 - `findings(analysis_id, seq, kind, severity, rule_id, other_rule_id, behavioral, payload_json)`
-  —— 支持按严重级别/是否影响行为过滤。
+  —— 支持按严重级别/是否影响行为过滤；
+- `active_pointer(id, active_id, revision)` —— 单行（`id = 1`）发布指针，初始化时为
+  `active_id = NULL`、`revision = 0`；`active_id` 外键指向 `analyses(id)`，因此只能发布
+  已保存版本；
+- `active_history(seq, revision, previous_id, active_id, activated_at)` —— 只增不改的发布
+  审计表：每次成功切换在同一事务内追加一行，记录前一版本/新版本、新 revision 与 UTC 时间，
+  支持只读分页查询。
+
+发布切换在单个 `BEGIN IMMEDIATE` 写事务内"读取当前 revision → 与 `expected_revision` 比较
+→ 更新指针并 +1 → 追加历史"，并发发布由 SQLite 写锁串行化，revision 不匹配的请求得到
+`409`，保证不会互相覆盖。
 
 `covered` 以十进制文本存储，以容纳超出 64 位整数范围的 IPv6 地址计数（如 /32 的 2^96）。
 

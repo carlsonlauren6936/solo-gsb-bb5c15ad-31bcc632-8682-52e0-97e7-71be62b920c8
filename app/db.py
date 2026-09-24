@@ -1,10 +1,12 @@
 """SQLite persistence layer.
 
-The database stores three things:
+The database stores five things:
 
-* ``analyses`` : immutable analysis versions (request metadata + full result JSON)
-* ``rules``    : one row per analyzed rule, for SQL-level filtering
-* ``findings`` : one row per finding / minimal conflict pair, for SQL-level filtering
+* ``analyses``       : immutable analysis versions (request metadata + full result JSON)
+* ``rules``          : one row per analyzed rule, for SQL-level filtering
+* ``findings``       : one row per finding / minimal conflict pair, for SQL-level filtering
+* ``active_pointer`` : singleton row (id=1) holding the currently published version
+* ``active_history`` : append-only audit log of every successful pointer switch
 """
 
 from __future__ import annotations
@@ -58,6 +60,31 @@ CREATE TABLE IF NOT EXISTS findings (
 CREATE INDEX IF NOT EXISTS idx_rules_analysis   ON rules(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_findings_analysis ON findings(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_analyses_hash    ON analyses(ruleset_hash);
+
+-- Singleton publication pointer: exactly one row (id = 1). It starts at
+-- revision 0 with no published version and only points at saved analyses.
+CREATE TABLE IF NOT EXISTS active_pointer (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    active_id    TEXT REFERENCES analyses(id),
+    revision     INTEGER NOT NULL
+);
+
+-- Append-only audit trail. Every successful activate (including re-pointing
+-- at the same version, which is still a distinct publication action) appends
+-- one row with the previous/new version ids, the revision it produced and
+-- when it happened. Rows are never updated or deleted; the foreign key uses
+-- RESTRICT so a published analysis cannot be removed out from under the log.
+CREATE TABLE IF NOT EXISTS active_history (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision      INTEGER NOT NULL,
+    previous_id   TEXT REFERENCES analyses(id),
+    active_id     TEXT NOT NULL REFERENCES analyses(id),
+    activated_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_active_history_revision ON active_history(revision);
+
+INSERT OR IGNORE INTO active_pointer (id, active_id, revision) VALUES (1, NULL, 0);
 """
 
 # In-memory cache of the configured path so tests can override it once.
@@ -123,6 +150,7 @@ def reset_db(path: str | None = None) -> None:
         set_db_path(path)
     with _connect() as conn:
         conn.executescript(
+            "DROP TABLE IF EXISTS active_history; DROP TABLE IF EXISTS active_pointer; "
             "DROP TABLE IF EXISTS findings; DROP TABLE IF EXISTS rules; DROP TABLE IF EXISTS analyses;"
         )
         conn.executescript(_SCHEMA)
@@ -300,3 +328,101 @@ def query_findings(
         }
         for r in rows
     ]
+
+
+class RevisionConflict(Exception):
+    """Raised when an optimistic-concurrency activation loses the revision race.
+
+    Carries the pointer state as it currently stands in the database so the
+    API can return it to the caller.
+    """
+
+    def __init__(self, current: dict[str, Any]):
+        super().__init__(
+            f"pointer revision {current['revision']} does not match expected revision"
+        )
+        self.current = current
+
+
+def get_active() -> dict[str, Any]:
+    """Return the current publication pointer (singleton row id = 1)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT active_id, revision FROM active_pointer WHERE id = 1"
+        ).fetchone()
+    return {"active_id": row["active_id"], "revision": row["revision"]}
+
+
+def activate_pointer(analysis_id: str, expected_revision: int) -> dict[str, Any]:
+    """Publish ``analysis_id`` when the pointer still sits at ``expected_revision``.
+
+    The revision check, pointer update, revision increment and history insert
+    happen in one immediate (write) SQLite transaction, so concurrent publishes
+    are serialized: exactly one request per revision value can win, and a loser
+    gets :class:`RevisionConflict` carrying the current state. A successful
+    switch always bumps the revision and appends an audit row, even when the new
+    target equals the already published version.
+
+    Callers must verify beforehand that ``analysis_id`` is a saved analysis;
+    the foreign key on ``active_pointer.active_id`` is the final backstop.
+    """
+    conn = _connect()
+    # An unmanaged transaction: BEGIN IMMEDIATE takes the write lock up front
+    # so two competing activations cannot both observe the same revision.
+    conn.isolation_level = None
+    activated_at = utc_now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT active_id, revision FROM active_pointer WHERE id = 1"
+        ).fetchone()
+        current_revision = row["revision"]
+        if current_revision != expected_revision:
+            conn.execute("ROLLBACK")
+            raise RevisionConflict(
+                {"active_id": row["active_id"], "revision": current_revision}
+            )
+
+        new_revision = current_revision + 1
+        conn.execute(
+            "UPDATE active_pointer SET active_id = ?, revision = ? WHERE id = 1",
+            (analysis_id, new_revision),
+        )
+        cur = conn.execute(
+            """INSERT INTO active_history
+               (revision, previous_id, active_id, activated_at)
+               VALUES (?, ?, ?, ?)""",
+            (new_revision, row["active_id"], analysis_id, activated_at),
+        )
+        history_seq = cur.lastrowid
+        conn.execute("COMMIT")
+    except Exception:
+        # ROLLBACK is a no-op once the conflict path has already rolled back;
+        # ignore that and let the original exception propagate.
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        conn.close()
+        raise
+    conn.close()
+
+    return {
+        "active_id": analysis_id,
+        "revision": new_revision,
+        "activated_at": activated_at,
+        "history_seq": history_seq,
+        "previous": {"active_id": row["active_id"], "revision": current_revision},
+    }
+
+
+def list_active_history(limit: int = 50, offset: int = 0) -> tuple[int, list[dict[str, Any]]]:
+    """Read-only audit log of successful switches, newest first."""
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) AS c FROM active_history").fetchone()["c"]
+        rows = conn.execute(
+            """SELECT seq, revision, previous_id, active_id, activated_at
+               FROM active_history ORDER BY seq DESC LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+    return total, [dict(r) for r in rows]
