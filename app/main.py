@@ -14,6 +14,9 @@ GET    /api/analyses/{id}/redundant-rules    per-rule removability inventory (re
 GET    /api/analyses/{id}/export.json        download the result as a JSON file
 GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
 POST   /api/analyses/{id}/change-guard/{oid} authorize the semantic diff against caller-supplied grants
+GET    /api/active                           current publish pointer (revision + active version)
+POST   /api/active/activate                  move the pointer to a saved version (optimistic CAS)
+GET    /api/active/history                   read-only activation history
 GET    /health                               liveness probe
 """
 
@@ -35,7 +38,13 @@ from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
 from .merge_precheck import build_batch, merge_precheck
 from .redundant import redundant_rule_inventory
-from .schemas import AnalyzeRequest, ChangeGuardRequest, MergePrecheckRequest, SimulateRequest
+from .schemas import (
+    ActivateRequest,
+    AnalyzeRequest,
+    ChangeGuardRequest,
+    MergePrecheckRequest,
+    SimulateRequest,
+)
 from .simulate import PatchError, apply_patch, rebuild_input_rules
 
 
@@ -373,3 +382,65 @@ def change_guard_versions(base_id: str, target_id: str, req: ChangeGuardRequest)
         raise HTTPException(status_code=404, detail=f"analysis '{target_id}' not found")
 
     return guard_changes(base, target, grants)
+
+
+# ---------------------------------------------------------------------------
+# Publish pointer: which saved version is currently "active".
+# ---------------------------------------------------------------------------
+
+@app.get("/api/active")
+def get_active_pointer() -> dict[str, Any]:
+    """Current publish pointer.
+
+    Starts at ``revision: 0, active_id: null``; every successful activation
+    bumps ``revision`` by one and points ``active_id`` at a saved version.
+    """
+    return db.get_active()
+
+
+@app.post("/api/active/activate", status_code=200)
+def activate_pointer(req: ActivateRequest):
+    # No return annotation: the 409 path returns a JSONResponse while the
+    # success path returns a plain dict, so FastAPI must not build a
+    # response model from a union type.
+    """Publish a saved version (optimistic-concurrency compare-and-swap).
+
+    The caller submits the target ``analysis_id`` plus the
+    ``expected_revision`` it last observed.  Inside a single SQLite
+    transaction the service verifies the target is a *saved* version, checks
+    the revision, moves the pointer and increments the revision, and appends
+    an activation-history row.  A revision mismatch means a concurrent
+    activation won the race: the request fails with ``409`` and the current
+    pointer state, so concurrent publishes never overwrite each other.
+    """
+    outcome = db.activate_analysis(req.analysis_id, req.expected_revision)
+    if outcome["outcome"] == "not_found":
+        raise HTTPException(status_code=404, detail=f"analysis '{req.analysis_id}' not found")
+    if outcome["outcome"] == "conflict":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "revision_conflict",
+                "detail": (
+                    f"expected_revision {req.expected_revision} does not match the current "
+                    f"revision {outcome['current']['revision']}; another activation changed "
+                    "the pointer — fetch GET /api/active and retry with the fresh revision"
+                ),
+                "current": outcome["current"],
+            },
+        )
+    return outcome["state"]
+
+
+@app.get("/api/active/history")
+def get_active_history(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """Read-only activation history, newest first.
+
+    Each row records one successful switch: the new ``revision``, the
+    ``previous_id`` / ``active_id`` pair and the activation time.
+    """
+    total, activations = db.list_activations(limit=limit, offset=offset)
+    return {"total": total, "activations": activations}

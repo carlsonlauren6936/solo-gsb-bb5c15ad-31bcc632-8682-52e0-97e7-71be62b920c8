@@ -104,6 +104,9 @@ N 的实际覆盖碎片。
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
 | GET | `/api/analyses/{base}/diff/{target}` | 两个已保存版本的**最终生效动作语义差异**（最小 CIDR + 分类计数） |
 | POST | `/api/analyses/{base}/change-guard/{target}` | **变更守卫**：用调用方给出的授权条目核对两版本的语义差异，返回是否通过及未授权的最小 CIDR |
+| GET | `/api/active` | 当前**发布指针**：`revision` + 指向的已保存版本 `active_id` |
+| POST | `/api/active/activate` | **发布切换**：携带 `expected_revision` 的乐观并发 CAS，冲突返回 `409` 与当前状态 |
+| GET | `/api/active/history` | 只读**发布历史**：每次成功切换的前后版本、时间与 revision |
 | GET | `/health` | 健康检查 |
 
 ### 示例：提交分析
@@ -652,6 +655,55 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 - 字段层面错误（`from_action == to_action`、未知动作、空 `authorizations`、多余字段等）→ `422`；
 - 任一版本不存在 → `404`。
 
+### 发布指针（active pointer）
+
+服务维护一个**全局唯一的发布指针**，标记"当前生效"的已保存分析版本。初始状态为
+`revision: 0, active_id: null`；每次成功切换 `revision` 递增 1，并写入一条发布历史。
+
+```bash
+# 查看当前指针
+curl -s http://localhost:8080/api/active
+# {"revision": 0, "active_id": null, "updated_at": null}
+
+# 发布一个已保存版本（首次发布 expected_revision=0）
+curl -s -X POST http://localhost:8080/api/active/activate \
+  -H 'Content-Type: application/json' \
+  -d '{"analysis_id": "an_e38b58f57faf2325", "expected_revision": 0}'
+
+# 查看发布历史（最新在前，limit/offset 分页）
+curl -s "http://localhost:8080/api/active/history?limit=10"
+```
+
+成功切换的响应：
+
+```json
+{
+  "revision": 1,
+  "active_id": "an_e38b58f57faf2325",
+  "previous_id": null,
+  "activated_at": "2026-09-24T12:00:00Z"
+}
+```
+
+**并发安全（乐观并发 CAS）**：`expected_revision` 是调用方上次通过 `GET /api/active` 观察到的
+revision。服务端在**同一个 SQLite 事务**（`BEGIN IMMEDIATE`）里核对目标版本已保存、核对
+revision、更新指针并递增 revision、写入历史——并发发布在数据库写锁上串行化，后到者读到的是
+已递增的 revision，必然冲突而**不会覆盖先到者的发布**。revision 不匹配时返回 `409` 并携带
+当前指针状态：
+
+```json
+{
+  "error": "revision_conflict",
+  "detail": "expected_revision 0 does not match the current revision 1; another activation changed the pointer — fetch GET /api/active and retry with the fresh revision",
+  "current": {"revision": 1, "active_id": "an_e38b58f57faf2325", "updated_at": "2026-09-24T12:00:00Z"}
+}
+```
+
+调用方重新 `GET /api/active` 拿到最新 revision 后重试即可。指针只能指向**已保存版本**
+（`save:false` 的预演结果不落库，其 id 与未知 id 一样返回 `404`）；失败的切换不会改动指针，
+也不会产生历史记录。历史接口是**只读**的，每行记录一次成功切换的 `revision`、
+`previous_id`、`active_id` 与 `activated_at`。
+
 ### 错误处理
 
 - 非法 CIDR（语法错误、主机位非零、rule_id 重复等）→ `400`，形如
@@ -667,6 +719,8 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
   `{"error": "invalid_change_guard", "detail": "...", "issues": ["...全部问题..."]}`
 - 字段类型/取值错误（未知 action、空规则列表、多余字段、缺少必填查询参数等）→ `422`（Pydantic 校验错误）
 - 版本不存在 → `404`
+- 发布指针 revision 冲突（`expected_revision` 与当前不一致，说明有并发发布先成功）→ `409`，形如
+  `{"error": "revision_conflict", "detail": "...", "current": {"revision": 1, "active_id": "an_...", "updated_at": "..."}}`
 
 ---
 
@@ -693,6 +747,7 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 ├── tests/test_redundant_rules.py # 冗余规则盘点端点测试
 ├── tests/test_simulate.py      # 规则变更预演端点测试
 ├── tests/test_merge_precheck.py # 双批次合并预检端点测试
+├── tests/test_active.py        # 发布指针端点测试（含并发竞争）
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化
@@ -706,7 +761,11 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 - `rules(analysis_id, rule_index, rule_id, cidr, ip_version, action, priority, source_tag,
   role, status, covered, has_conflict)` —— 支持 SQL 过滤；
 - `findings(analysis_id, seq, kind, severity, rule_id, other_rule_id, behavioral, payload_json)`
-  —— 支持按严重级别/是否影响行为过滤。
+  —— 支持按严重级别/是否影响行为过滤；
+- `active_pointer(id, revision, active_id, updated_at)` —— 单行发布指针（`id` 恒为 1），
+  `revision` 从 0 开始、每次成功发布递增 1；
+- `active_history(seq, revision, previous_id, active_id, activated_at)` —— 只追加的发布历史，
+  每次成功切换记录前后版本、时间与 revision。
 
 `covered` 以十进制文本存储，以容纳超出 64 位整数范围的 IPv6 地址计数（如 /32 的 2^96）。
 

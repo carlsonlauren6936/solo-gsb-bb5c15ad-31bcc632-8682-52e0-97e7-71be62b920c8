@@ -1,10 +1,12 @@
 """SQLite persistence layer.
 
-The database stores three things:
+The database stores five things:
 
-* ``analyses`` : immutable analysis versions (request metadata + full result JSON)
-* ``rules``    : one row per analyzed rule, for SQL-level filtering
-* ``findings`` : one row per finding / minimal conflict pair, for SQL-level filtering
+* ``analyses``       : immutable analysis versions (request metadata + full result JSON)
+* ``rules``          : one row per analyzed rule, for SQL-level filtering
+* ``findings``       : one row per finding / minimal conflict pair, for SQL-level filtering
+* ``active_pointer`` : single-row publish pointer (revision + currently active version)
+* ``active_history`` : one row per successful activation (audit trail)
 """
 
 from __future__ import annotations
@@ -54,6 +56,23 @@ CREATE TABLE IF NOT EXISTS findings (
     payload_json  TEXT NOT NULL,
     PRIMARY KEY (analysis_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS active_pointer (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    revision   INTEGER NOT NULL,
+    active_id  TEXT REFERENCES analyses(id),
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS active_history (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision     INTEGER NOT NULL,
+    previous_id  TEXT,
+    active_id    TEXT NOT NULL,
+    activated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO active_pointer (id, revision, active_id) VALUES (1, 0, NULL);
 
 CREATE INDEX IF NOT EXISTS idx_rules_analysis   ON rules(analysis_id);
 CREATE INDEX IF NOT EXISTS idx_findings_analysis ON findings(analysis_id);
@@ -123,7 +142,9 @@ def reset_db(path: str | None = None) -> None:
         set_db_path(path)
     with _connect() as conn:
         conn.executescript(
-            "DROP TABLE IF EXISTS findings; DROP TABLE IF EXISTS rules; DROP TABLE IF EXISTS analyses;"
+            "DROP TABLE IF EXISTS findings; DROP TABLE IF EXISTS rules; "
+            "DROP TABLE IF EXISTS active_history; DROP TABLE IF EXISTS active_pointer; "
+            "DROP TABLE IF EXISTS analyses;"
         )
         conn.executescript(_SCHEMA)
 
@@ -300,3 +321,97 @@ def query_findings(
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Publish pointer: which saved version is currently "active" (live).
+# ---------------------------------------------------------------------------
+
+def _pointer_state(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {"revision": 0, "active_id": None, "updated_at": None}
+    return {
+        "revision": row["revision"],
+        "active_id": row["active_id"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_active() -> dict[str, Any]:
+    """Current publish pointer: ``revision`` + the version it points to."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT revision, active_id, updated_at FROM active_pointer WHERE id = 1"
+        ).fetchone()
+    return _pointer_state(row)
+
+
+def activate_analysis(analysis_id: str, expected_revision: int) -> dict[str, Any]:
+    """Move the publish pointer to a saved version (optimistic-concurrency CAS).
+
+    The existence check, revision check, pointer update and history insert all
+    happen in one ``BEGIN IMMEDIATE`` transaction, so concurrent activations
+    serialize on the database write lock: the loser re-reads the bumped
+    revision and reports a conflict instead of silently overwriting the
+    winner's pointer.
+
+    Returns ``{"outcome": "not_found" | "conflict" | "activated", ...}``; the
+    API layer maps the outcome to 404 / 409 / 200.
+    """
+    conn = _connect()
+    try:
+        # Take the write lock up front so a racing activation cannot slip
+        # between our revision check and the pointer update.
+        conn.execute("BEGIN IMMEDIATE")
+        # Defensive: the schema script seeds the row, but never assume.
+        conn.execute(
+            "INSERT OR IGNORE INTO active_pointer (id, revision, active_id) VALUES (1, 0, NULL)"
+        )
+        if conn.execute("SELECT 1 FROM analyses WHERE id = ?", (analysis_id,)).fetchone() is None:
+            conn.rollback()
+            return {"outcome": "not_found"}
+        row = conn.execute(
+            "SELECT revision, active_id, updated_at FROM active_pointer WHERE id = 1"
+        ).fetchone()
+        current = _pointer_state(row)
+        if current["revision"] != expected_revision:
+            conn.rollback()
+            return {"outcome": "conflict", "current": current}
+        now = utc_now_iso()
+        new_revision = current["revision"] + 1
+        conn.execute(
+            "UPDATE active_pointer SET revision = ?, active_id = ?, updated_at = ? WHERE id = 1",
+            (new_revision, analysis_id, now),
+        )
+        conn.execute(
+            """INSERT INTO active_history (revision, previous_id, active_id, activated_at)
+               VALUES (?, ?, ?, ?)""",
+            (new_revision, current["active_id"], analysis_id, now),
+        )
+        conn.commit()
+        return {
+            "outcome": "activated",
+            "state": {
+                "revision": new_revision,
+                "active_id": analysis_id,
+                "previous_id": current["active_id"],
+                "activated_at": now,
+            },
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_activations(limit: int = 50, offset: int = 0) -> tuple[int, list[dict[str, Any]]]:
+    """Activation history, newest first (read-only audit trail)."""
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) AS c FROM active_history").fetchone()["c"]
+        rows = conn.execute(
+            """SELECT seq, revision, previous_id, active_id, activated_at
+               FROM active_history ORDER BY seq DESC LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+    return total, [dict(r) for r in rows]
